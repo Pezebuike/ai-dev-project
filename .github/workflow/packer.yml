@@ -1,0 +1,96 @@
+name: Packer Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment to build for"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - qa
+          - prod
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  resolve-environment:
+    runs-on: ubuntu-latest
+    outputs:
+      var_file: ${{ steps.resolve.outputs.var_file }}
+      environment: ${{ steps.resolve.outputs.environment }}
+
+    steps:
+      - name: Resolve variable file based on event
+        id: resolve
+        run: |
+          EVENT="${{ github.event_name }}"
+
+          if [ "$EVENT" == "workflow_dispatch" ]; then
+            # Manual run — use the environment the user selected
+            ENV="${{ github.event.inputs.environment }}"
+
+          elif [ "$EVENT" == "push" ]; then
+            # Push to main — always target prod
+            ENV="prod"
+
+          elif [ "$EVENT" == "pull_request" ]; then
+            # Pull request — use dev for validation
+            ENV="dev"
+          fi
+
+          case "$ENV" in
+            qa)   VAR_FILE="packer/qavariables.pkrvars.hcl" ;;
+            prod) VAR_FILE="packer/prodvariables.pkrvars.hcl" ;;
+            *)    VAR_FILE="packer/devvariables.pkrvars.hcl" ;;
+          esac
+
+          echo "environment=$ENV" >> $GITHUB_OUTPUT
+          echo "var_file=$VAR_FILE" >> $GITHUB_OUTPUT
+          echo "Event: $EVENT | Environment: $ENV | Var file: $VAR_FILE"
+
+  packer:
+    runs-on: ubuntu-latest
+    needs: resolve-environment
+    env:
+      VAR_FILE: ${{ needs.resolve-environment.outputs.var_file }}
+      ENVIRONMENT: ${{ needs.resolve-environment.outputs.environment }}
+
+    steps:
+      - name: Checkout code repository
+        uses: actions/checkout@v4
+
+      - name: Set up Packer
+        uses: hashicorp/setup-packer@v4
+        # with:
+        #   version: 1.9.0
+
+      - name: Install AWS CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aws-cli
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: "eu-east-1"
+
+      - name: Initialize Packer
+        run: packer init packer/aws-ubuntu.pkr.hcl
+
+      - name: Validate Packer template
+        run: packer validate -var-file="$VAR_FILE" packer/aws-ubuntu.pkr.hcl
+
+      - name: Format Packer template
+        run: packer fmt packer/aws-ubuntu.pkr.hcl
+
+      - name: Build AMI with Packer
+        run: packer build -var-file="$VAR_FILE" packer/aws-ubuntu.pkr.hcl
